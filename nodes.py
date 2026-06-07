@@ -3,7 +3,8 @@ FastVideoCombine — Drop-in replacement for VideoHelperSuite's Video Combine no
 
 Optimised encoding pipeline:
   Tier 1  Batched GPU→CPU transfer + threaded ffmpeg pipe writes   (no extra deps)
-  Tier 3  GPU-direct NVENC via VPF / PyNvVideoCodec                (optional)
+  Tier 2  GPU-direct NVENC via PyNvVideoCodec                      (optional)
+          pip install pynvvideocodec
 
 Auto-selects the fastest available backend; falls back gracefully.
 """
@@ -34,24 +35,13 @@ from PIL.PngImagePlugin import PngInfo
 import folder_paths
 from comfy.utils import ProgressBar
 
-# ---------------------------------------------------------------------------
-# Optional GPU-direct encoder (Tier 3)
-# ---------------------------------------------------------------------------
-_gpu_encoder_name: str | None = None
+_has_pynvvideocodec = False
 
 try:
-    import PyNvCodec as nvc        # type: ignore[import-untyped]
-    import PytorchNvCodec as pnvc  # type: ignore[import-untyped]
-    _gpu_encoder_name = "VPF"
+    import PyNvVideoCodec as _nvc  # type: ignore[import-untyped]  # pip install pynvvideocodec
+    _has_pynvvideocodec = True
 except ImportError:
     pass
-
-if _gpu_encoder_name is None:
-    try:
-        import PyNvVideoCodec as pnvc_v2  # type: ignore[import-untyped]
-        _gpu_encoder_name = "PyNvVideoCodec"
-    except ImportError:
-        pass
 
 logger = logging.getLogger("FastVideoCombine")
 
@@ -305,6 +295,29 @@ def to_pingpong(inp):
     yield from inp
     for i in range(len(inp) - 2, 0, -1):
         yield inp[i]
+
+
+def _rgb_to_nv12_gpu(tensor: torch.Tensor) -> torch.Tensor:
+    """BT.709 limited-range RGB [0,1] float32 → NV12 uint8, entirely on GPU.
+
+    Input:  [H, W, 3] float32 in [0, 1]
+    Output: [H*3//2, W] uint8  (Y plane then interleaved UV)
+    """
+    R, G, B = tensor[..., 0], tensor[..., 1], tensor[..., 2]
+    H, W = R.shape
+
+    Y  = (16.0  + 65.481 * R + 128.553 * G + 24.966 * B).clamp_(16, 235)
+    Cb = (128.0 - 37.797 * R -  74.203 * G + 112.0  * B).clamp_(16, 240)
+    Cr = (128.0 + 112.0  * R -  93.786 * G -  18.214 * B).clamp_(16, 240)
+
+    Y_u8 = Y.to(torch.uint8)
+
+    Cb_sub = Cb.view(H // 2, 2, W // 2, 2).mean(dim=(1, 3)).to(torch.uint8)
+    Cr_sub = Cr.view(H // 2, 2, W // 2, 2).mean(dim=(1, 3)).to(torch.uint8)
+
+    UV = torch.stack([Cb_sub, Cr_sub], dim=-1).view(H // 2, W)
+
+    return torch.cat([Y_u8, UV], dim=0).contiguous()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -644,10 +657,9 @@ def _inject_cuda_colorspace(args: list[str]) -> list[str]:
     return args
 
 
-# --- Tier 3: GPU-direct NVENC via VPF -----------------------------------
+# --- Tier 2: GPU-direct NVENC via PyNvVideoCodec ------------------------
 
 def _is_nvenc_format(video_format: dict) -> bool:
-    """Check if the format JSON uses an NVENC codec."""
     main_pass = video_format.get("main_pass", [])
     for i, arg in enumerate(main_pass):
         if arg == "-c:v" and i + 1 < len(main_pass):
@@ -658,7 +670,6 @@ def _is_nvenc_format(video_format: dict) -> bool:
 
 
 def _nvenc_codec_name(video_format: dict) -> str:
-    """Extract the codec short-name (h264 / hevc / av1) from an nvenc format."""
     main_pass = video_format.get("main_pass", [])
     for i, arg in enumerate(main_pass):
         if arg == "-c:v" and i + 1 < len(main_pass):
@@ -673,6 +684,18 @@ def _nvenc_codec_name(video_format: dict) -> str:
     return "h264"
 
 
+def _parse_bitrate_bps(bitrate_arg: list[str]) -> int:
+    for i, a in enumerate(bitrate_arg):
+        if a == "-b:v" and i + 1 < len(bitrate_arg):
+            raw = bitrate_arg[i + 1]
+            if raw.endswith("M"):
+                return int(raw[:-1]) * 1_000_000
+            if raw.endswith("K"):
+                return int(raw[:-1]) * 1_000
+            return int(raw)
+    return 10_000_000
+
+
 def encode_gpu_direct(
     images_iter,
     file_path: str,
@@ -685,52 +708,42 @@ def encode_gpu_direct(
     env: dict,
     bitrate_arg: list[str],
 ) -> int | None:
-    """Tier-3: encode frames entirely on the GPU via VPF.
+    """Tier-3: encode frames on GPU via PyNvVideoCodec (``pip install pynvvideocodec``).
 
-    Returns the number of frames encoded, or ``None`` if GPU encoding
-    is unavailable / unsupported for this format, signalling the caller
-    to fall back to Tier 1.
+    Frames stay on the GPU for RGB→NV12 conversion and NVENC encoding.
+    Only the compressed bitstream touches the CPU (for file I/O and muxing).
+
+    Returns frame count, or ``None`` to fall back to Tier 1.
     """
-    if _gpu_encoder_name != "VPF":
+    if not _has_pynvvideocodec:
         return None
     if not _is_nvenc_format(video_format):
         return None
 
     codec = _nvenc_codec_name(video_format)
-    gpu_id = 0
-
-    bitrate_val = "10M"
-    for i, a in enumerate(bitrate_arg):
-        if a == "-b:v" and i + 1 < len(bitrate_arg):
-            bitrate_val = bitrate_arg[i + 1]
+    gpu_id = torch.cuda.current_device()
+    bitrate_bps = _parse_bitrate_bps(bitrate_arg)
 
     try:
-        enc_params = {
-            "preset": "P4",
-            "codec": codec,
-            "s": f"{width}x{height}",
-            "bitrate": bitrate_val.replace("M", "000000").replace("K", "000"),
-        }
-
-        encoder = nvc.PyNvEncoder(enc_params, gpu_id)  # type: ignore[name-defined]
-
-        to_nv12 = nvc.PySurfaceConverter(  # type: ignore[name-defined]
-            width, height,
-            nvc.PixelFormat.RGB_PLANAR, nvc.PixelFormat.NV12,  # type: ignore[name-defined]
-            gpu_id,
-        )
-        cc_ctx = nvc.ColorspaceConversionContext(  # type: ignore[name-defined]
-            nvc.ColorSpace.BT_709, nvc.ColorRange.MPEG,  # type: ignore[name-defined]
+        encoder = _nvc.CreateEncoder(  # type: ignore[name-defined]
+            width=width,
+            height=height,
+            fmt="NV12",
+            usecpuinputbuffer=False,
+            codec=codec,
+            preset="P4",
+            gpu_id=gpu_id,
+            rc="vbr",
+            bitrate=bitrate_bps,
+            maxbitrate=bitrate_bps * 2,
+            fps=int(frame_rate),
         )
     except Exception as exc:
-        logger.info("VPF encoder init failed (%s) — falling back to ffmpeg", exc)
+        logger.info("PyNvVideoCodec init failed (%s) — falling back to ffmpeg", exc)
         return None
 
-    extension = video_format.get("extension", "mp4")
     raw_path = file_path + f".raw.{codec}"
-    enc_frame = np.ndarray(shape=(0,), dtype=np.uint8)
     total = 0
-    first_frame = True
 
     try:
         with open(raw_path, "wb") as f:
@@ -738,44 +751,17 @@ def encode_gpu_direct(
                 if not tensor.is_cuda:
                     tensor = tensor.cuda()
 
-                # float32 [0,1] → uint8 on GPU
-                frame_u8 = (tensor * 255 + 0.5).clamp(0, 255).to(torch.uint8)
-
-                # [H,W,C] → [C,H,W] contiguous
-                frame_chw = frame_u8.permute(2, 0, 1).contiguous()
-
-                # Tensor → VPF Surface (RGB planar)
-                surf = nvc.Surface.Make(  # type: ignore[name-defined]
-                    nvc.PixelFormat.RGB_PLANAR, width, height, gpu_id  # type: ignore[name-defined]
-                )
-                surf_plane = surf.PlanePtr()
-                pnvc.TensorToDptr(  # type: ignore[name-defined]
-                    frame_chw,
-                    surf_plane.GpuMem(),
-                    surf_plane.Width(),
-                    surf_plane.Height(),
-                    surf_plane.Pitch(),
-                    surf_plane.ElemSize(),
-                )
-
-                # RGB → NV12 on GPU
-                nv12 = to_nv12.Execute(surf, cc_ctx)
-
-                success = encoder.EncodeSingleSurface(nv12, enc_frame)
-                if success:
-                    f.write(bytearray(enc_frame))
+                nv12 = _rgb_to_nv12_gpu(tensor)
+                bitstream = encoder.Encode(nv12)
+                if len(bitstream) > 0:
+                    f.write(bytearray(bitstream))
 
                 total += 1
                 pbar.update(1)
 
-                first_frame = False
-
-            while True:
-                success = encoder.FlushSinglePacket(enc_frame)
-                if success:
-                    f.write(bytearray(enc_frame))
-                else:
-                    break
+            remaining = encoder.EndEncode()
+            if len(remaining) > 0:
+                f.write(bytearray(remaining))
 
     except Exception as exc:
         try:
@@ -786,7 +772,6 @@ def encode_gpu_direct(
             f"GPU-direct encoding failed at frame {total}: {exc}"
         ) from exc
 
-    # Mux raw bitstream → container via ffmpeg (copy, no re-encode)
     fmt_flag = {"h264": "h264", "hevc": "hevc", "av1": "ivf"}.get(codec, "h264")
     mux_args = [
         ffmpeg_path, "-v", "error", "-y",
@@ -806,7 +791,6 @@ def encode_gpu_direct(
         subprocess.run(mux_args, env=env, capture_output=True, check=True)
     except subprocess.CalledProcessError as exc:
         logger.warning("Muxing failed: %s", exc.stderr.decode(*ENCODE_ARGS))
-        # Fall back: rename raw file so user at least has the data
         os.rename(raw_path, file_path)
         return total
 
@@ -827,9 +811,9 @@ class FastVideoCombine:
     """Optimised drop-in replacement for VHS Video Combine.
 
     Tier selection is automatic:
-      • VPF / PyNvVideoCodec detected + NVENC format → GPU-direct  (fastest)
-      • otherwise → batched GPU→CPU with threaded ffmpeg pipe      (fast)
-      • pre_pass / gifski formats → legacy per-frame generator     (compatible)
+      • PyNvVideoCodec + NVENC format → Tier 2 GPU-direct  (fastest)
+      • otherwise → Tier 1 batched GPU→CPU + threaded ffmpeg pipe (fast)
+      • pre_pass / gifski formats → legacy per-frame generator (compatible)
     """
 
     @classmethod
@@ -1214,7 +1198,7 @@ class FastVideoCombine:
                         meta_batch.reset()
 
             else:
-                # ── Optimised path (Tier 3 → Tier 1 fallback) ──────────
+                # ── Optimised path (Tier 2 → Tier 1 fallback) ──────────
                 if "inputs_main_pass" in video_format:
                     in_args_len = args.index("-i") + 2
                     args = (
@@ -1224,7 +1208,7 @@ class FastVideoCombine:
                     )
 
                 gpu_result = None
-                if _gpu_encoder_name and not is_16bit:
+                if _has_pynvvideocodec and not is_16bit:
                     try:
                         gpu_result = encode_gpu_direct(
                             images_iter=images,
@@ -1247,8 +1231,7 @@ class FastVideoCombine:
                 if gpu_result is not None:
                     total_frames_output = gpu_result
                     logger.info(
-                        "GPU-direct encode (%s): %d frames via %s",
-                        _gpu_encoder_name,
+                        "GPU-direct encode (PyNvVideoCodec): %d frames, %s",
                         total_frames_output,
                         _nvenc_codec_name(video_format),
                     )
