@@ -595,68 +595,6 @@ def gifski_process(args, dimensions, frame_rate, video_format, file_path, env):
     yield total
 
 
-# --- CUDA hwaccel colorspace conversion (bypasses CPU swscale) ----------
-
-_cuda_hwaccel_supported: bool | None = None
-
-
-def _check_cuda_hwaccel() -> bool:
-    """One-time probe: does this ffmpeg build have hwupload_cuda + scale_cuda?"""
-    global _cuda_hwaccel_supported
-    if _cuda_hwaccel_supported is not None:
-        return _cuda_hwaccel_supported
-    if ffmpeg_path is None:
-        _cuda_hwaccel_supported = False
-        return False
-    try:
-        result = subprocess.run(
-            [ffmpeg_path, "-hide_banner", "-filters"],
-            capture_output=True, text=True, timeout=5,
-        )
-        has_both = "hwupload_cuda" in result.stdout and "scale_cuda" in result.stdout
-        _cuda_hwaccel_supported = has_both
-        if has_both:
-            logger.info("CUDA hwaccel filters available — GPU colorspace conversion enabled")
-    except Exception:
-        _cuda_hwaccel_supported = False
-    return _cuda_hwaccel_supported
-
-
-def _inject_cuda_colorspace(args: list[str]) -> list[str]:
-    """For NVENC codecs: replace CPU swscale with GPU-accelerated scale_cuda.
-
-    Moves RGB→NV12 conversion from CPU (5-15ms/frame) to GPU (<1ms/frame).
-    Returns modified args, or original args if not applicable.
-    """
-    if not _check_cuda_hwaccel():
-        return args
-
-    try:
-        cv_idx = args.index("-c:v")
-        codec = args[cv_idx + 1]
-    except (ValueError, IndexError):
-        return args
-    if not isinstance(codec, str) or "nvenc" not in codec:
-        return args
-
-    args = list(args)
-
-    for i in range(cv_idx, len(args) - 1):
-        if args[i] == "-pix_fmt":
-            args.pop(i)
-            args.pop(i)
-            break
-
-    try:
-        vf_idx = args.index("-vf")
-        existing = args[vf_idx + 1]
-        args[vf_idx + 1] = f"hwupload_cuda,scale_cuda=format=nv12,{existing}"
-    except ValueError:
-        args += ["-vf", "hwupload_cuda,scale_cuda=format=nv12"]
-
-    return args
-
-
 # --- Tier 2: GPU-direct NVENC via PyNvVideoCodec ------------------------
 
 def _is_nvenc_format(video_format: dict) -> bool:
@@ -1239,7 +1177,6 @@ class FastVideoCombine:
                     ffmpeg_args = list(args)
                     ffmpeg_args += video_format["main_pass"] + bitrate_arg
                     merge_filter_args(ffmpeg_args)
-                    ffmpeg_args = _inject_cuda_colorspace(ffmpeg_args)
 
                     batch_sz = _optimal_batch_size(
                         dimensions[1], dimensions[0], channels,
