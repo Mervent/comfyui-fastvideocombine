@@ -847,6 +847,7 @@ class FastVideoCombine:
             images = iter(images)
 
         # --- output paths -----------------------------------------------
+        filename_prefix = datetime.datetime.now().strftime(filename_prefix)
         output_dir = (
             folder_paths.get_output_directory() if save_output
             else folder_paths.get_temp_directory()
@@ -1268,8 +1269,8 @@ class FastVideoCombine:
 # Registration
 # ═══════════════════════════════════════════════════════════════════════════
 NODE_CLASS_MAPPINGS = {
-    "FastVideoCombine": FastVideoCombine,
+    "VHS_VideoCombineFast": FastVideoCombine,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FastVideoCombine": "Video Combine (Fast) ⚡",
+    "VHS_VideoCombineFast": "Video Combine (Fast) ⚡",
 }
